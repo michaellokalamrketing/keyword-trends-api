@@ -17,22 +17,27 @@ FastAPI backend pro trendy klíčových slov (CZ/SK) + správa okruhů/klíčov�
   DELETE /api/keywords/{id}
 Nasazení: uvicorn app:app --host 0.0.0.0 --port 8000
 """
-import os, time, sqlite3, json
+import os, time, sqlite3
 from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pytrends.request import TrendReq
-import numpy as np
 import pandas as pd
 
 API_KEY = os.environ.get("API_KEY", "CHANGE_ME")
 
-app = FastAPI(title="Keyword Trends API", version="0.1.0")
+app = FastAPI(title="Keyword Trends API", version="0.2.0")
+
+# ---- CORS ----
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://zakazanepribehy.cz",
+        "https://www.zakazanepribehy.cz",
+        "https://keyword-trends-api.onrender.com"  # během testování
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -66,6 +71,10 @@ init_db()
 # ---- auth ----
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
+    # preflight OPTIONS → pustíme bez ověření
+    if request.method == "OPTIONS":
+        return JSONResponse({"ok": True}, status_code=200)
+
     if request.url.path.startswith("/api/"):
         key = request.headers.get("X-API-Key")
         if key != API_KEY:
@@ -116,12 +125,23 @@ def pytrends_client():
 # ---- API: trends ----
 @app.get("/api/trending")
 def api_trending(geo: str = "CZ"):
-    key = f"trending:{geo}"
+    # mapování pro pytrends
+    pn_map = {
+        "CZ": "czech_republic",
+        "SK": "slovakia",
+        "US": "united_states",
+        "GB": "united_kingdom",
+        "DE": "germany",
+        "PL": "poland",
+    }
+    pn = pn_map.get(geo.upper(), "czech_republic")
+
+    key = f"trending:{pn}"
     cached = cache_get(key)
     if cached: return {"items": cached}
     try:
         pt = pytrends_client()
-        df = pt.trending_searches(pn=geo.lower())
+        df = pt.trending_searches(pn=pn)
         df.columns = ["query"]
         items = df["query"].dropna().head(30).tolist()
     except Exception as e:
