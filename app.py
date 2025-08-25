@@ -36,11 +36,11 @@ app.add_middleware(
     allow_origins=[
         "https://zakazanepribehy.cz",
         "https://www.zakazanepribehy.cz",
-        "https://keyword-trends-api.onrender.com"  # během testování
+        "https://keyword-trends-api.onrender.com",  # ponech během testů
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # zahrnuje i X-API-Key
 )
 
 DB_PATH = os.environ.get("DB_PATH", "data.db")
@@ -71,14 +71,17 @@ init_db()
 # ---- auth ----
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    # preflight OPTIONS → pustíme bez ověření
+    # DŮLEŽITÉ: preflight OPTIONS nevracej sám,
+    # ale pusť dál na CORSMiddleware, ať doplní CORS hlavičky
     if request.method == "OPTIONS":
-        return JSONResponse({"ok": True}, status_code=200)
+        return await call_next(request)
 
+    # Ověřuj klíč jen pro skutečné /api/* požadavky
     if request.url.path.startswith("/api/"):
         key = request.headers.get("X-API-Key")
         if key != API_KEY:
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
     return await call_next(request)
 
 # ---- models ----
