@@ -123,7 +123,14 @@ def parse_since(s: str) -> str:
     return "today 12-m"
 
 def pytrends_client():
-    return TrendReq(hl="cs-CZ", tz=120)
+    # robustnější klient: delší timeout + retries (pytrends je „citlivý“)
+    return TrendReq(
+        hl="cs-CZ",
+        tz=120,
+        timeout=(10, 30),   # (connect, read)
+        retries=2,
+        backoff_factor=0.4  # krátký exponenciální backoff
+    )
 
 # ---- API: trends ----
 @app.get("/api/trending")
@@ -137,80 +144,38 @@ def api_trending(geo: str = "CZ"):
         "DE": "germany",
         "PL": "poland",
     }
-    pn = pn_map.get(geo.upper(), "czech_republic")
+    primary = pn_map.get(geo.upper(), "czech_republic")
+    key = f"trending:{primary}"
 
-    key = f"trending:{pn}"
+    # 1) zkus vytáhnout z cache (snížíme šanci na 502)
     cached = cache_get(key)
-    if cached: return {"items": cached}
-    try:
+    if cached:
+        return {"items": cached, "cached": True}
+
+    def fetch_trending(pn: str):
         pt = pytrends_client()
         df = pt.trending_searches(pn=pn)
         df.columns = ["query"]
-        items = df["query"].dropna().head(30).tolist()
-    except Exception as e:
-        raise HTTPException(502, detail=f"pytrends error: {e}")
-    cache_set(key, items, ttl=60*30)
-    return {"items": items}
+        return df["query"].dropna().head(30).tolist()
 
-@app.get("/api/interest")
-def api_interest(kw: str, geo: str = "CZ", since: str = "12m"):
-    tf = parse_since(since)
-    key = f"interest:{kw}:{geo}:{tf}"
-    cached = cache_get(key)
-    if cached: return cached
-    try:
-        pt = pytrends_client()
-        pt.build_payload([kw], timeframe=tf, geo=geo)
-        df = pt.interest_over_time()
-        if df.empty or kw not in df.columns:
-            raise ValueError("Empty interest")
-        series = df[kw].fillna(0)
-        labels = [str(i) for i in series.index]
-        values = series.astype(int).tolist()
-        payload = {"labels": labels, "values": values}
-        cache_set(key, payload)
-        return payload
-    except Exception as e:
-        raise HTTPException(502, detail=f"pytrends error: {e}")
-
-@app.get("/api/related")
-def api_related(kw: str, geo: str = "CZ", since: str = "12m"):
-    tf = parse_since(since)
-    key = f"related:{kw}:{geo}:{tf}"
-    cached = cache_get(key)
-    if cached: return cached
-    try:
-        pt = pytrends_client()
-        pt.build_payload([kw], timeframe=tf, geo=geo)
-        rq = pt.related_queries()
-        block = rq.get(kw, {}) if isinstance(rq, dict) else {}
-        out = {"top": [], "rising": []}
-        if "top" in block and isinstance(block["top"], pd.DataFrame):
-            out["top"] = block["top"][["query","value"]].fillna(0).to_dict(orient="records")
-        if "rising" in block and isinstance(block["rising"], pd.DataFrame):
-            out["rising"] = block["rising"][["query","value"]].fillna(0).to_dict(orient="records")
-        cache_set(key, out, ttl=60*30)
-        return out
-    except Exception as e:
-        raise HTTPException(502, detail=f"pytrends error: {e}")
-
-@app.post("/api/batch_interest")
-def api_batch_interest(payload: BatchInterestIn):
-    tf = parse_since(payload.since)
-    labels = None
-    series_out = []
-    for term in payload.seeds[:5]:
-        try:
-            pt = pytrends_client()
-            pt.build_payload([term], timeframe=tf, geo=payload.geo)
-            df = pt.interest_over_time()
-            if df.empty or term not in df.columns: continue
-            s = df[term].fillna(0)
-            if labels is None: labels = [str(i) for i in s.index]
-            series_out.append({"term": term, "values": s.astype(int).tolist()})
-        except Exception:
+    # 2) pokus o primary → fallback na CZ → fallback na US
+    tried = []
+    for pn in [primary, "czech_republic", "united_states"]:
+        if pn in tried:
             continue
-    return {"labels": labels or [], "series": series_out}
+        tried.append(pn)
+        try:
+            items = fetch_trending(pn)
+            if items:
+                cache_set(key, items, ttl=60 * 30)  # 30 min cache
+                return {"items": items, "pn": pn, "cached": False}
+        except Exception:
+            # pokračuj na další fallback
+            continue
+
+    # 3) žádný fetch nevyšel → vrať prázdný seznam (200), ať UI nespadne
+    return {"items": [], "note": "trending temporarily unavailable"}
+
 
 # ---- API: groups/keywords ----
 @app.get("/api/groups")
@@ -256,4 +221,8 @@ def delete_keyword(kid: int):
     con = db(); cur = con.cursor()
     cur.execute("DELETE FROM keywords WHERE id=?", (kid,))
     con.commit(); con.close()
+    return {"ok": True}
+
+@app.get("/healthz")
+def healthz():
     return {"ok": True}
